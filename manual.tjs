@@ -1,0 +1,9 @@
+Plugins.link("diff.dll");
+
+var origin = "time=0 string1";
+var change = "time=3600 string2";
+var dif = krDiff.getDiff(origin, change);
+System.inform(dif);
+var dif_change = krDiff.loadDiff(origin, dif);
+System.inform(dif_change); 
+System.inform(dif_change == change); // true
