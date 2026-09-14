@@ -1,4 +1,4 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 #include "ncbind.hpp"
 #include "diff_match_patch.h"
 #include <windows.h>
@@ -6,7 +6,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <map>
+#include <memory>
 #include <sstream>
 
 using namespace std;
@@ -17,7 +17,7 @@ class krDiff
 public:
     // getDiffAsync(oldText, newText, callbackFunction, callbackData = void)
     // callbackFunction(patchText, callbackData, errorText) 会在 Kirikiri 主线程中执行。
-    // 后台计算可以并行，但回调会严格按照调用顺序触发。
+    // 后台计算可以并行，回调按照任务实际完成顺序触发。
     static tjs_error TJS_INTF_METHOD getDiffPatchAsync(tTJSVariant *result, tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *objthis)
     {
         if (numparams < 3 || !param[0] || !param[1] || !param[2])
@@ -35,14 +35,13 @@ public:
         tTJSVariant callbackData;
         if (numparams >= 4 && param[3])
             callbackData = *param[3];
-        DiffTask *task = new DiffTask(oldText.c_str(), newText.c_str(), *param[2], callbackData, nextIssueSequence);
+        DiffTask *task = new DiffTask(oldText.c_str(), newText.c_str(), *param[2], callbackData);
         uintptr_t thread = _beginthreadex(NULL, 0, &diffThreadProc, task, 0, NULL);
         if (!thread)
         {
             delete task;
             return TJS_E_FAIL;
         }
-        ++nextIssueSequence;
         ::CloseHandle((HANDLE)thread);
         if (result)
             *result = 0;
@@ -126,20 +125,14 @@ private:
         wstring oldText, newText, patchText, errorText;
         tTJSVariant callback;
         tTJSVariant callbackData;
-        tjs_uint sequence;
         DiffTask(const wchar_t *oldValue, const wchar_t *newValue,
-                 const tTJSVariant &callbackValue, const tTJSVariant &callbackDataValue,
-                 tjs_uint taskSequence)
+                 const tTJSVariant &callbackValue, const tTJSVariant &callbackDataValue)
             : oldText(oldValue), newText(newValue), callback(callbackValue),
-              callbackData(callbackDataValue), sequence(taskSequence) {}
+              callbackData(callbackDataValue) {}
     };
 
     static HWND messageWindow;
     static ATOM messageWindowClass;
-    static tjs_uint nextIssueSequence;
-    static tjs_uint nextDeliverSequence;
-    static map<tjs_uint, DiffTask *> completedTasks;
-
     static bool ensureMessageWindow()
     {
         if (messageWindow)
@@ -175,11 +168,23 @@ private:
             task->errorText = L"unknown error while generating patch";
         }
 
+        // patch 已经生成，后续等待主线程回调时不再需要输入全文。
+        // swap 会同时释放字符串容量，clear 只会清空长度但通常保留内存。
+        wstring().swap(task->oldText);
+        wstring().swap(task->newText);
+
         // 工作线程只投递纯 C++ 数据，绝不调用或释放 TJS 对象。
         if (!::PostMessage(messageWindow, WM_KRDIFF_COMPLETE, 0, (LPARAM)task))
         {
-            // 投递失败通常表示插件正在卸载。此处调用 TJS 并不安全，
-            // 因此清理由正常的关闭流程处理。
+            // 消息队列满时改为同步交给窗口所属的主线程，避免 task 泄漏。
+            // completionWndProc 返回非零表示已经接管并释放 task。
+            if (!messageWindow || !::SendMessageW(messageWindow, WM_KRDIFF_COMPLETE, 0, (LPARAM)task))
+            {
+                // 这里只能释放不涉及 TJS 的大块字符串；callback 与
+                // callbackData 必须留给主线程销毁，避免跨线程调用 TJS。
+                wstring().swap(task->patchText);
+                wstring().swap(task->errorText);
+            }
         }
         return 0;
     }
@@ -190,49 +195,41 @@ private:
         {
             DiffTask *task = reinterpret_cast<DiffTask *>(lp);
             if (task)
-                queueCompletedTask(task);
-            return 0;
+                invokeCallbackAndDelete(task);
+            return TRUE;
         }
         return ::DefWindowProc(hwnd, message, wp, lp);
     }
 
-    // 此函数只在主线程运行。提前完成的任务会在此等待，直到
-    // 所有更早提交的任务都已回调，从而保证回调顺序。
-    static void queueCompletedTask(DiffTask *task)
-    {
-        completedTasks[task->sequence] = task;
-        for (;;)
-        {
-            map<tjs_uint, DiffTask *>::iterator it = completedTasks.find(nextDeliverSequence);
-            if (it == completedTasks.end())
-                break;
-
-            DiffTask *nextTask = it->second;
-            completedTasks.erase(it);
-            ++nextDeliverSequence;
-            invokeCallbackAndDelete(nextTask);
-        }
-    }
-
     static void invokeCallbackAndDelete(DiffTask *task)
     {
-        tTJSVariant patch(tTJSString(task->patchText.c_str()));
-        tTJSVariant error(tTJSString(task->errorText.c_str()));
-        tTJSVariant *args[] = {&patch, &task->callbackData, &error};
-        tTJSVariantClosure closure(task->callback.AsObjectClosureNoAddRef());
+        // 即使 TJS 回调抛出异常，task 以及 callback/callbackData 也会释放。
+        unique_ptr<DiffTask> ownedTask(task);
+        try
+        {
+            tTJSVariant patch(tTJSString(task->patchText.c_str()));
+            tTJSVariant error(tTJSString(task->errorText.c_str()));
 
-        // 直接调用保存的函数闭包，并保留其原始 this。
-        (void)closure.FuncCall(0, NULL, NULL, NULL, 3, args, NULL);
-        delete task;
+            // TJS 参数已经拥有自己的字符串；先释放 C++ 结果缓冲区，
+            // 避免执行回调期间同时保留两份大 patch。
+            wstring().swap(task->patchText);
+            wstring().swap(task->errorText);
+
+            tTJSVariant *args[] = {&patch, &task->callbackData, &error};
+            tTJSVariantClosure closure(task->callback.AsObjectClosureNoAddRef());
+
+            // 直接调用保存的函数闭包，并保留其原始 this。
+            (void)closure.FuncCall(0, NULL, NULL, NULL, 3, args, NULL);
+        }
+        catch (...)
+        {
+            ::OutputDebugStringW(L"krDiff: asynchronous callback threw an exception\n");
+        }
     }
 };
 
 HWND krDiff::messageWindow = NULL;
 ATOM krDiff::messageWindowClass = 0;
-tjs_uint krDiff::nextIssueSequence = 0;
-tjs_uint krDiff::nextDeliverSequence = 0;
-map<tjs_uint, krDiff::DiffTask *> krDiff::completedTasks;
-
 NCB_REGISTER_CLASS(krDiff)
 {
     RawCallback("getDiff", &Class::getDiffPatch, 0);
